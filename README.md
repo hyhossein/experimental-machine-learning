@@ -422,3 +422,1551 @@ Execution artifacts (error messages, profiling data, build warnings) are fed bac
 
 - **vLLM** — High-throughput LLM serving engine with PagedAttention.
   - Repository: [github.com/vllm-project/vllm](https://github.com/vllm-project/vllm)
+
+---
+
+
+## 18. Production GPU Deployment on Azure ML (SDK v2)
+
+Everything up to this point assumes you have a model and want to make it better, faster, or smaller. This section assumes you have a model and need to put it behind a URL that other systems can call reliably. The gap between "it works on my machine" and "it works as a managed endpoint" is where most ML engineering time actually goes.
+
+Azure ML SDK v2 organizes deployment around five objects: **MLClient** (authentication), **Endpoint** (the stable URL), **Deployment** (the running container behind that URL), **Environment** (the Docker image plus packages), and **CodeConfiguration** (the scoring script). Understanding the boundaries between these objects prevents most first-time deployment failures.
+
+```python
+from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+
+ml_client = MLClient(
+    DefaultAzureCredential(),
+    subscription_id="your-sub-id",
+    resource_group_name="your-rg",
+    workspace_name="your-workspace",
+)
+```
+
+`DefaultAzureCredential` works automatically from Azure ML compute instances. Use `AzureCliCredential` after `az login` when running from a local machine.
+
+### 18.1 The Environment Build Problem
+
+Azure ML builds a Docker image from your conda YAML plus a base image. Complex environments — anything combining PyTorch, CUDA, transformers, and vLLM — routinely time out during the Docker build step. This is the single biggest source of failed deployments, and it happens before your code even runs.
+
+Three principles that prevent most build failures: keep conda YAMLs minimal with exact version pins and don't mix conda channels with pip for the same library. Use Microsoft's CUDA base images (`mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:latest`) instead of building CUDA from scratch. Register the environment separately before deploying — this isolates the Docker build from the model download and container startup, so you know immediately which step failed.
+
+When a build times out, Azure throws `ResourceOperationFailure` with "timeout while waiting for Environment Image." The actual build log lives in your workspace storage account under `aml-environment-image-build/{env-name}/{version}/`. The error message from Azure itself is never specific enough to diagnose the problem — always check the build log directly.
+
+A working GPU environment YAML for vLLM serving:
+
+```yaml
+name: vllm-serving-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - vllm==0.13.0
+      - torch==2.9.0
+      - transformers==4.57.3
+      - sentencepiece
+      - protobuf
+```
+
+A working CPU environment YAML for an orchestrator that coordinates calls to GPU endpoints:
+
+```yaml
+name: orchestrator-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - sentence-transformers==3.0.1
+      - torch==2.2.2
+      - scikit-learn==1.5.0
+      - numpy==1.26.4
+      - pydantic==2.7.4
+      - pyyaml==6.0.1
+```
+
+> *Environment versions are immutable. Once Azure ML registers an environment at a specific version number, it caches the built Docker image. Changing the conda YAML and re-registering with the same version number silently uses the old cached build. You must bump the version number every time you change the YAML. This is not documented prominently and causes hours of confusion when a "fixed" environment produces the exact same error.*
+
+### 18.2 The azureml-inference-server-http Dependency Trap
+
+The `azureml-inference-server-http` package is required for managed endpoints — it wraps your `init()` and `run()` functions into the HTTP server that Azure calls. But it pins strict sub-dependency versions that silently dictate your entire dependency tree.
+
+Version 1.3.2 requires `pydantic~=2.7.1`. Pinning `pydantic==2.8.0` in the same YAML fails the Docker build with a pip resolver conflict. Version 1.5.0 requires `pydantic~=2.11.0` and specific `opentelemetry` versions. Upgrading the inference server without matching its telemetry pins breaks the build.
+
+> *Before pinning any package version in your environment YAML, run `pip show azureml-inference-server-http` to see what it requires. Match your pins to its constraints, not the other way around. This single package is the most common hidden cause of environment build failures.*
+
+### 18.3 Environment Reference Formats
+
+When referencing an environment in a deployment, format matters. For environments in the same workspace, use `"azureml:my-env:2"` or just `"my-env:2"`. Using the full ARM resource path (`azureml:/subscriptions/.../environments/my-env/versions/2`) for same-workspace environments causes cryptic failures. The full path is only needed for cross-workspace references.
+
+### 18.4 The Scoring Script Contract
+
+Azure ML calls `init()` once when the container starts and `run(raw_data)` for each request. The contract is simple but the failure modes are subtle.
+
+```python
+import os, json, logging
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global model
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    logger.info(f"Model dir contents: {os.listdir(model_dir)}")
+    # Load your model from model_dir
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    # ... inference ...
+    return json.dumps({"result": "..."})
+```
+
+Four rules that each cost days of debugging when broken:
+
+**`run()` must return a string.** Returning a Python dict instead of `json.dumps(result)` causes silent failures — the endpoint appears healthy but returns empty or malformed responses. The Azure inference server expects a serialized string and does not auto-convert.
+
+**`AZUREML_MODEL_DIR` has a subdirectory.** When Azure downloads your registered model, it places the files inside a subdirectory of the model dir. Hardcoding the path without listing the directory first fails. Always discover the actual path at runtime:
+
+```python
+model_root = os.environ.get("AZUREML_MODEL_DIR")
+subdirs = [d for d in os.listdir(model_root)
+           if os.path.isdir(os.path.join(model_root, d))]
+model_path = os.path.join(model_root, subdirs[0])
+```
+
+**Verify every import against your pinned version.** A class that exists in version 0.15 of a library may not exist in 0.13. If your environment pins `vllm==0.13.0` but your scoring script imports a class from 0.15, the container crashes during `init()` with an ImportError you cannot see until the container manages to start. Run `pip show <package>` on your compute instance and verify the actual API surface before writing any imports.
+
+**Log everything in `init()`.** If `init()` fails, the container crashes silently and the deployment stays in "Creating" state indefinitely. Print the model directory listing, library versions, GPU device count, and available VRAM. This diagnostic output is the only thing that tells you what went wrong.
+
+### 18.5 vLLM Scoring Script Pattern
+
+For serving LLMs via vLLM inside Azure ML with an OpenAI-compatible interface:
+
+```python
+import os, json, logging
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global llm, tokenizer
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_dir)
+               if os.path.isdir(os.path.join(model_dir, d))]
+    model_path = os.path.join(model_dir, subdirs[0]) if subdirs else model_dir
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    llm = LLM(
+        model=model_path,
+        tokenizer=model_path,
+        dtype="auto",              # bf16 on A100, fp16 on T4
+        max_model_len=8192,
+        gpu_memory_utilization=0.90,
+        trust_remote_code=True,
+    )
+    logger.info("vLLM engine loaded")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    messages = data.get("messages", [])
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    params = SamplingParams(
+        temperature=data.get("temperature", 0.3),
+        max_tokens=data.get("max_tokens", 2048),
+        top_p=data.get("top_p", 0.95),
+    )
+    outputs = llm.generate([prompt], params)
+    text = outputs[0].outputs[0].text
+    return json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "usage": {
+            "prompt_tokens": len(outputs[0].prompt_token_ids),
+            "completion_tokens": len(outputs[0].outputs[0].token_ids),
+        },
+    })
+```
+
+The `dtype="auto"` setting is important — vLLM selects bf16 on A100 (which natively supports it) and fp16 on T4 (which does not). Forcing bf16 on a T4 causes a silent performance collapse because the hardware emulates it in software.
+
+### 18.6 NER / Classification Scoring Script Pattern
+
+For smaller models (token classification, span extraction, entity linking) that fit on a T4:
+
+```python
+import os, json
+
+def init():
+    global model
+    model_root = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_root)
+               if os.path.isdir(os.path.join(model_root, d))]
+    model_path = os.path.join(model_root, subdirs[0])
+    # model = YourNERModel.from_pretrained(model_path)
+    # model = model.to("cuda")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    text = data["text"]
+    labels = data.get("labels", ["PERSON", "ORG", "CONDITION"])
+    threshold = data.get("threshold", 0.5)
+    entities = model.predict_entities(text, labels)
+    filtered = [e for e in entities if e["score"] >= threshold]
+    return json.dumps({"entities": filtered})
+```
+
+---
+
+## 19. GPU SKU Selection and Model Sizing
+
+Choosing the right GPU SKU is a sizing problem, not a feature comparison. The question is always: does the model fit in VRAM with enough headroom for the KV cache and intermediate activations?
+
+### 19.1 Available SKUs
+
+| SKU | GPU | VRAM | Approx. Cost | Best For |
+| --- | --- | --- | --- | --- |
+| Standard_NC4as_T4_v3 | T4 | 16 GB | ~$0.53/hr | NER, classifiers, models ≤7B |
+| Standard_NC12s_v3 | V100 | 12 GB | ~$0.90/hr | Mid-size models, fp16 |
+| Standard_NC24ads_A100_v4 | A100 | 80 GB | ~$3.67/hr | 20B+ params, vLLM serving |
+| Standard_NC40ads_H100_v5 | H100 NVL | 94 GB | Higher | Faster A100 alternative |
+| Standard_NV36ads_A10_v5 | A10 | 24 GB | Mid-range | Fallback when A100 is unavailable |
+
+### 19.2 Model Size to GPU Mapping
+
+A model in fp16 needs approximately **2× its parameter count in GB of VRAM**. Each parameter is 2 bytes. For fp32, multiply by 4. For 4-bit quantization (AWQ, GPTQ), divide the fp16 requirement by 4.
+
+| Model Size | FP16 VRAM | 4-bit VRAM | Minimum SKU |
+| --- | --- | --- | --- |
+| 7B parameters | ~14 GB | ~3.5 GB | T4 (tight) or V100 |
+| 14B parameters | ~28 GB | ~7 GB | A10 or A100 |
+| 20B parameters | ~40 GB | ~10 GB | A100 |
+| 70B parameters | ~140 GB | ~35 GB | A100 80GB (quantized only) |
+
+These numbers are for weights alone. The KV cache, intermediate activations, and vLLM's memory management overhead add 10–20% on top. Multiply the weight estimate by 1.15 to get a practical minimum, then check that it sits below 85% of total VRAM to leave room for CUDA memory fragmentation.
+
+> *We spent seven days debugging an endpoint that kept crashing on startup. The container would start, `init()` would begin loading the model, VRAM would fill, CUDA would throw out-of-memory, the container would crash, Azure would restart it, and the cycle would repeat. The deployment never left "Creating" state and logs were inaccessible because the container never lived long enough to produce them. The root cause was a 14.5 GB model (fp16) on a 12 GB GPU. The fix was using a larger SKU. The debugging cost far exceeded the price difference between T4 and A10.*
+
+### 19.3 GPU Fallback Chains
+
+Large GPU SKUs (A100, H100) are frequently out of capacity, especially in popular regions. A production deployment script should try SKUs in preference order and catch capacity errors to fall through:
+
+```yaml
+gpu_sku_fallback:
+  - instance_type: "Standard_NC24ads_A100_v4"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NC40ads_H100_v5"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NV36ads_A10_v5"
+    max_model_len: 4096     # degraded context window
+    gpu_memory_utilization: 0.85
+```
+
+Each tier carries its own vLLM configuration to account for different VRAM budgets. The A10 fallback cuts context length in half — this is acceptable for many workloads and much better than failing to deploy entirely.
+
+GPU quota is regional. Check your quota before deploying: some regions have zero available A100/H100 quota. Requesting an increase through the Azure portal takes 1–3 business days. Discover this during planning, not at deployment time.
+
+---
+
+## 20. Deployment Configuration
+
+### 20.1 The Full Deployment Script
+
+```python
+from azure.ai.ml.entities import (
+    ManagedOnlineEndpoint,
+    ManagedOnlineDeployment,
+    CodeConfiguration,
+    OnlineRequestSettings,
+    ProbeSettings,
+)
+
+# 1. Create endpoint (the stable URL)
+endpoint = ManagedOnlineEndpoint(
+    name="my-llm-endpoint",
+    auth_mode="key",
+)
+endpoint = ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# 2. Create deployment (the running container)
+deployment = ManagedOnlineDeployment(
+    name="blue",
+    endpoint_name="my-llm-endpoint",
+    model="azureml:my-model:1",
+    environment="azureml:vllm-serving-env:2",
+    code_configuration=CodeConfiguration(
+        code="./scoring_scripts",
+        scoring_script="score.py",
+    ),
+    instance_type="Standard_NC24ads_A100_v4",
+    instance_count=1,
+    request_settings=OnlineRequestSettings(
+        request_timeout_ms=300000,       # 5 min per request
+        max_concurrent_requests_per_instance=1,
+        max_queue_wait_ms=300000,
+    ),
+    liveness_probe=ProbeSettings(
+        initial_delay=600,    # 10 min before first health check
+        timeout=30,
+        period=100,
+        failure_threshold=30,
+    ),
+    readiness_probe=ProbeSettings(
+        initial_delay=600,
+        timeout=30,
+        period=30,
+        failure_threshold=30,
+    ),
+)
+deployment = ml_client.online_deployments.begin_create_or_update(deployment).result()
+
+# 3. Route traffic
+endpoint.traffic = {"blue": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+```
+
+### 20.2 Why Probe Settings Matter
+
+Large models take 5–10 minutes to load into GPU memory during `init()`. Azure ML uses liveness and readiness probes to check container health. If a probe fires before `init()` finishes loading the model, Azure concludes the container is unhealthy, kills it, and starts a new one. The new container also takes 5–10 minutes to load, gets killed, and the cycle repeats. The deployment stays in "Creating" state forever with no logs visible.
+
+> *Set `initial_delay` to at least 600 seconds (10 minutes) for any deployment that loads a large model. For 70B+ models, use 900 seconds. This single setting prevents the most common invisible failure mode in GPU deployments. It is not documented prominently and there is no error message that tells you the probe is the problem — the deployment simply never transitions out of "Creating."*
+
+### 20.3 The SDK Object Gotcha
+
+The SDK requires `OnlineRequestSettings` and `ProbeSettings` to be proper SDK objects, not Python dicts. Passing a dict compiles without error and the deployment appears to succeed, but timeout behavior does not work as configured:
+
+```python
+# WRONG — dict compiles but fails silently
+request_settings={"request_timeout_ms": 180000}
+
+# CORRECT — use the SDK class
+request_settings=OnlineRequestSettings(request_timeout_ms=180000)
+```
+
+### 20.4 Model Registration
+
+Before deploying, register your model in the workspace:
+
+```python
+from azure.ai.ml.entities import Model
+from azure.ai.ml.constants import AssetTypes
+
+model = Model(
+    name="my-model",
+    version="1",
+    path="/path/to/model/files",
+    type=AssetTypes.CUSTOM_MODEL,
+    description="Model description",
+)
+registered = ml_client.models.create_or_update(model)
+```
+
+For large models (40GB+), upload to Azure Blob Storage first, then register using the blob path. Direct upload from a compute instance is unreliable for files this size.
+
+---
+
+## 21. Blue-Green Deployments and Traffic Routing
+
+Azure ML supports multiple deployments under a single endpoint. Each deployment runs independently with its own model version, environment, and SKU. Traffic is split by percentage. This enables canary rollouts, A/B testing, and zero-downtime model updates.
+
+```python
+# Deploy green alongside existing blue
+green = ManagedOnlineDeployment(
+    name="green",
+    endpoint_name="my-llm-endpoint",
+    # ... new model version, new environment ...
+)
+ml_client.online_deployments.begin_create_or_update(green).result()
+
+# Canary: 10% to green
+endpoint.traffic = {"blue": 90, "green": 10}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Full cutover after validation
+endpoint.traffic = {"blue": 0, "green": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Remove old deployment to stop billing
+ml_client.online_deployments.begin_delete(
+    name="blue", endpoint_name="my-llm-endpoint"
+).result()
+```
+
+You can bypass the traffic split entirely by adding the header `azureml-model-deployment: green` to a request, routing it to a specific deployment for testing before shifting any production traffic.
+
+> *A newly created deployment receives 0% traffic by default. If you deploy and forget to set traffic, the endpoint returns errors for all requests because no deployment is receiving them. Always explicitly set traffic after creating a deployment.*
+
+---
+
+## 22. Multi-Endpoint Orchestrator Architecture
+
+Complex ML pipelines that chain multiple models — summarization feeding into NER feeding into fact-checking — should not be deployed as a single monolithic endpoint. Deploy each model as its own endpoint and use a lightweight CPU orchestrator as the single client-facing entry point.
+
+```
+Client → Orchestrator (CPU endpoint)
+              ├── LLM Summarizer   (GPU, A100)
+              ├── NER Model A       (GPU, T4)
+              ├── NER Model B       (GPU, T4)
+              └── Entity Linker     (GPU or CPU)
+```
+
+The orchestrator receives the client request, fans out HTTP calls to sub-endpoints in parallel using `ThreadPoolExecutor`, collects and merges results, and returns a unified response. It runs on a CPU SKU (`Standard_F8s_v2`, ~$0.34/hr) because it does no inference — only coordination, lightweight embedding, and result formatting.
+
+**Pass endpoint URLs and API keys in the request payload, not as environment variables.** This makes the system reconfigurable without redeploying the orchestrator. Swap a model endpoint, rotate an API key, or add a new NER model — all without touching the running orchestrator container.
+
+Dictionary-based NER and entity linking can run on CPU if latency tolerance is 2–3 seconds per call instead of sub-second. For single-document inference, CPU is fine. For batch processing hundreds of documents, GPU is worth it.
+
+### 22.1 Cost Example
+
+| Component | SKU | Count | Cost/hr |
+| --- | --- | --- | --- |
+| Orchestrator | F8s_v2 (CPU) | 1 | ~$0.34 |
+| LLM (20B params) | NC24ads A100 | 1 | ~$3.67 |
+| NER Models | NC4as T4 | 3 | ~$1.59 |
+| Entity Linkers | NC4as T4 | 3 | ~$1.59 |
+| **Total** | | | **~$7.19** |
+
+Adding a 70B model (AWQ 4-bit on A100) pushes the total to ~$11/hr. Evaluate whether the quality improvement justifies 3–4× the cost of the next tier down — often a distilled 20B model closes enough of the gap.
+
+---
+
+## 23. Debugging Failed Deployments
+
+### 23.1 The "Creating" State Loop
+
+The most frustrating failure mode: the deployment sits in "Creating" for 30+ minutes with no logs. The container has not started, so there is nothing to log. Diagnosis, in order of likelihood:
+
+**Environment build timeout.** Check the build log in your workspace storage account. If the Docker build failed, no container was ever created.
+
+**Probe restart loop.** If `initial_delay` is too short, the container loads for 5 minutes, gets killed by the liveness probe, restarts, loads again, gets killed again. Increase `initial_delay` to 600+ seconds.
+
+**GPU quota exhausted.** The deployment is waiting for capacity that does not exist. Check quota with:
+
+```python
+from azure.mgmt.compute import ComputeManagementClient
+
+compute_client = ComputeManagementClient(
+    DefaultAzureCredential(), "your-subscription-id"
+)
+for u in compute_client.usage.list("your-region"):
+    if any(k in u.name.localized_value.lower() for k in ["nc24", "a100", "gpu"]):
+        print(f"{u.name.localized_value}: {u.current_value}/{u.limit}")
+```
+
+**`init()` crashing.** Import errors, CUDA OOM, model file not found. You cannot see these until the container runs long enough to produce logs. Once it does:
+
+```python
+logs = ml_client.online_deployments.get_logs(
+    name="blue", endpoint_name="my-endpoint", lines=200
+)
+print(logs)
+```
+
+### 23.2 Common Error Patterns
+
+| Error | Root Cause | Fix |
+| --- | --- | --- |
+| timeout waiting for Environment Image | Conda env too complex for Docker build | Simplify YAML, use pre-built base image |
+| ImportError: cannot import name X | Library version mismatch | Verify import exists in pinned version |
+| Stuck in Creating indefinitely | init() crash or probe restart loop | Increase initial_delay, add logging to init() |
+| run() returns empty response | Returning dict instead of string | Always json.dumps() |
+| pydantic version conflict | azureml-inference-server-http pins pydantic | Match pydantic to server requirements |
+| CUDA out of memory | Model too large for GPU | Larger SKU or quantize the model |
+
+### 23.3 The Runtime Installation Escape Hatch
+
+When environment builds fail repeatedly — usually complex combinations of CUDA, PyTorch, and vLLM — there is a last-resort technique: use a minimal pre-built environment and install packages inside `init()` at runtime:
+
+```python
+import subprocess, sys, os
+
+def init():
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "torch", "transformers", "vllm", "--quiet"
+    ])
+    from vllm import LLM
+    global llm
+    llm = LLM(model=os.environ["AZUREML_MODEL_DIR"])
+```
+
+The first request takes 2–3 minutes while packages install. Subsequent requests use the cached installation. This bypasses the Docker build entirely. It is inelegant and should not be standard practice, but when nothing else works, it ships.
+
+---
+
+## 24. Deployment Lessons
+
+These are patterns that emerged from months of production deployment work. None are in the official documentation.
+
+### 24.1 Delete and Recreate; Never Update Failed Deployments
+
+When a deployment fails, calling `begin_create_or_update` on the same deployment usually fails again with stale state — cached Docker layers, partially downloaded models, corrupted container state. The reliable pattern is `begin_delete()`, wait for completion, create fresh. This adds 5 minutes but prevents hours of chasing phantom errors from stale state. Treat failed deployments as disposable.
+
+### 24.2 Register Environments Before Deploying
+
+Do not combine environment registration and deployment into one step. Register the environment first with `ml_client.environments.create_or_update()`, wait for the Docker image to build, confirm success, then deploy. This separates two independent failure modes — environment build and container startup — so you diagnose each one clearly. Combined, a failure could be either, and the error messages do not distinguish.
+
+### 24.3 The code_path Uploads Everything
+
+When you specify `code="./scoring_scripts"` in CodeConfiguration, Azure uploads **every file** in that directory to the deployment container. If the directory contains model weights, datasets, notebooks, or anything large, the upload will be slow or fail. Keep the code directory to scoring scripts and small config files only. Model weights belong in registered Azure ML models, not in the code path.
+
+### 24.4 Test Scoring Scripts Locally Before Deploying
+
+Your Azure ML compute instance has the same GPU that your endpoint will use. Before deploying, copy the scoring script to the compute, import it, call `init()` to load the model, call `run()` with sample JSON. This catches 90% of issues — import errors, model path problems, VRAM limits, serialization bugs — for free, in seconds, with full stack traces. A failed deployment takes 10–30 minutes to surface the same error, if it surfaces at all.
+
+### 24.5 Use Compute Instance Serving for Development
+
+Managed endpoints are for production — when other systems need a stable URL. During development and benchmarking, run the model directly on your compute instance. A vLLM server on localhost or an Ollama instance gives you the same inference quality with zero deployment overhead, zero extra cost beyond the compute itself, and instant iteration. Deploy as a managed endpoint only when you need a stable URL for integration.
+
+### 24.6 Pre-Deployment Checklist
+
+| Check | Verification | Failure If Skipped |
+| --- | --- | --- |
+| Environment builds | Register separately, wait for Docker build | 30 min in Creating, then failure |
+| Imports are valid | `pip show <pkg>` on compute instance | Container crash, no visible logs |
+| `run()` returns `json.dumps()` | Test locally with sample input | Empty or malformed responses |
+| Model fits GPU | Param count × 2 bytes ≤ VRAM × 0.85 | CUDA OOM, infinite restart loop |
+| Probe initial_delay ≥ 600s | Check deployment config | Container killed before load, stuck in Creating |
+| `azureml-inference-server-http` in env | Check conda YAML | No HTTP server, all requests fail |
+| Traffic set after deployment | Explicitly set `endpoint.traffic` | 0% traffic, endpoint returns errors |
+
+> *The most expensive lesson across all of this: the gap between "model works on a compute instance" and "model works as a managed endpoint" is almost entirely operational, not algorithmic. The model is the same. The math is the same. What changes is the packaging, the probes, the environment builds, the traffic routing, and the debugging visibility. Mastering this operational layer is what separates an ML engineer who builds prototypes from one who runs production systems.*
+
+---
+
+
+## 18. Production GPU Deployment on Azure ML (SDK v2)
+
+Everything up to this point assumes you have a model and want to make it better, faster, or smaller. This section assumes you have a model and need to put it behind a URL that other systems can call reliably. The gap between "it works on my machine" and "it works as a managed endpoint" is where most ML engineering time actually goes.
+
+Azure ML SDK v2 organizes deployment around five objects: **MLClient** (authentication), **Endpoint** (the stable URL), **Deployment** (the running container behind that URL), **Environment** (the Docker image plus packages), and **CodeConfiguration** (the scoring script). Understanding the boundaries between these objects prevents most first-time deployment failures.
+
+```python
+from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+
+ml_client = MLClient(
+    DefaultAzureCredential(),
+    subscription_id="your-sub-id",
+    resource_group_name="your-rg",
+    workspace_name="your-workspace",
+)
+```
+
+`DefaultAzureCredential` works automatically from Azure ML compute instances. Use `AzureCliCredential` after `az login` when running from a local machine.
+
+### 18.1 The Environment Build Problem
+
+Azure ML builds a Docker image from your conda YAML plus a base image. Complex environments — anything combining PyTorch, CUDA, transformers, and vLLM — routinely time out during the Docker build step. This is the single biggest source of failed deployments, and it happens before your code even runs.
+
+Three principles that prevent most build failures: keep conda YAMLs minimal with exact version pins and don't mix conda channels with pip for the same library. Use Microsoft's CUDA base images (`mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:latest`) instead of building CUDA from scratch. Register the environment separately before deploying — this isolates the Docker build from the model download and container startup, so you know immediately which step failed.
+
+When a build times out, Azure throws `ResourceOperationFailure` with "timeout while waiting for Environment Image." The actual build log lives in your workspace storage account under `aml-environment-image-build/{env-name}/{version}/`. The error message from Azure itself is never specific enough to diagnose the problem — always check the build log directly.
+
+A working GPU environment YAML for vLLM serving:
+
+```yaml
+name: vllm-serving-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - vllm==0.13.0
+      - torch==2.9.0
+      - transformers==4.57.3
+      - sentencepiece
+      - protobuf
+```
+
+A working CPU environment YAML for an orchestrator that coordinates calls to GPU endpoints:
+
+```yaml
+name: orchestrator-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - sentence-transformers==3.0.1
+      - torch==2.2.2
+      - scikit-learn==1.5.0
+      - numpy==1.26.4
+      - pydantic==2.7.4
+      - pyyaml==6.0.1
+```
+
+> *Environment versions are immutable. Once Azure ML registers an environment at a specific version number, it caches the built Docker image. Changing the conda YAML and re-registering with the same version number silently uses the old cached build. You must bump the version number every time you change the YAML. This is not documented prominently and causes hours of confusion when a "fixed" environment produces the exact same error.*
+
+### 18.2 The azureml-inference-server-http Dependency Trap
+
+The `azureml-inference-server-http` package is required for managed endpoints — it wraps your `init()` and `run()` functions into the HTTP server that Azure calls. But it pins strict sub-dependency versions that silently dictate your entire dependency tree.
+
+Version 1.3.2 requires `pydantic~=2.7.1`. Pinning `pydantic==2.8.0` in the same YAML fails the Docker build with a pip resolver conflict. Version 1.5.0 requires `pydantic~=2.11.0` and specific `opentelemetry` versions. Upgrading the inference server without matching its telemetry pins breaks the build.
+
+> *Before pinning any package version in your environment YAML, run `pip show azureml-inference-server-http` to see what it requires. Match your pins to its constraints, not the other way around. This single package is the most common hidden cause of environment build failures.*
+
+### 18.3 Environment Reference Formats
+
+When referencing an environment in a deployment, format matters. For environments in the same workspace, use `"azureml:my-env:2"` or just `"my-env:2"`. Using the full ARM resource path (`azureml:/subscriptions/.../environments/my-env/versions/2`) for same-workspace environments causes cryptic failures. The full path is only needed for cross-workspace references.
+
+### 18.4 The Scoring Script Contract
+
+Azure ML calls `init()` once when the container starts and `run(raw_data)` for each request. The contract is simple but the failure modes are subtle.
+
+```python
+import os, json, logging
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global model
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    logger.info(f"Model dir contents: {os.listdir(model_dir)}")
+    # Load your model from model_dir
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    # ... inference ...
+    return json.dumps({"result": "..."})
+```
+
+Four rules that each cost days of debugging when broken:
+
+**`run()` must return a string.** Returning a Python dict instead of `json.dumps(result)` causes silent failures — the endpoint appears healthy but returns empty or malformed responses. The Azure inference server expects a serialized string and does not auto-convert.
+
+**`AZUREML_MODEL_DIR` has a subdirectory.** When Azure downloads your registered model, it places the files inside a subdirectory of the model dir. Hardcoding the path without listing the directory first fails. Always discover the actual path at runtime:
+
+```python
+model_root = os.environ.get("AZUREML_MODEL_DIR")
+subdirs = [d for d in os.listdir(model_root)
+           if os.path.isdir(os.path.join(model_root, d))]
+model_path = os.path.join(model_root, subdirs[0])
+```
+
+**Verify every import against your pinned version.** A class that exists in version 0.15 of a library may not exist in 0.13. If your environment pins `vllm==0.13.0` but your scoring script imports a class from 0.15, the container crashes during `init()` with an ImportError you cannot see until the container manages to start. Run `pip show <package>` on your compute instance and verify the actual API surface before writing any imports.
+
+**Log everything in `init()`.** If `init()` fails, the container crashes silently and the deployment stays in "Creating" state indefinitely. Print the model directory listing, library versions, GPU device count, and available VRAM. This diagnostic output is the only thing that tells you what went wrong.
+
+### 18.5 vLLM Scoring Script Pattern
+
+For serving LLMs via vLLM inside Azure ML with an OpenAI-compatible interface:
+
+```python
+import os, json, logging
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global llm, tokenizer
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_dir)
+               if os.path.isdir(os.path.join(model_dir, d))]
+    model_path = os.path.join(model_dir, subdirs[0]) if subdirs else model_dir
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    llm = LLM(
+        model=model_path,
+        tokenizer=model_path,
+        dtype="auto",              # bf16 on A100, fp16 on T4
+        max_model_len=8192,
+        gpu_memory_utilization=0.90,
+        trust_remote_code=True,
+    )
+    logger.info("vLLM engine loaded")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    messages = data.get("messages", [])
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    params = SamplingParams(
+        temperature=data.get("temperature", 0.3),
+        max_tokens=data.get("max_tokens", 2048),
+        top_p=data.get("top_p", 0.95),
+    )
+    outputs = llm.generate([prompt], params)
+    text = outputs[0].outputs[0].text
+    return json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "usage": {
+            "prompt_tokens": len(outputs[0].prompt_token_ids),
+            "completion_tokens": len(outputs[0].outputs[0].token_ids),
+        },
+    })
+```
+
+The `dtype="auto"` setting is important — vLLM selects bf16 on A100 (which natively supports it) and fp16 on T4 (which does not). Forcing bf16 on a T4 causes a silent performance collapse because the hardware emulates it in software.
+
+### 18.6 NER / Classification Scoring Script Pattern
+
+For smaller models (token classification, span extraction, entity linking) that fit on a T4:
+
+```python
+import os, json
+
+def init():
+    global model
+    model_root = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_root)
+               if os.path.isdir(os.path.join(model_root, d))]
+    model_path = os.path.join(model_root, subdirs[0])
+    # model = YourNERModel.from_pretrained(model_path)
+    # model = model.to("cuda")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    text = data["text"]
+    labels = data.get("labels", ["PERSON", "ORG", "CONDITION"])
+    threshold = data.get("threshold", 0.5)
+    entities = model.predict_entities(text, labels)
+    filtered = [e for e in entities if e["score"] >= threshold]
+    return json.dumps({"entities": filtered})
+```
+
+---
+
+## 19. GPU SKU Selection and Model Sizing
+
+Choosing the right GPU SKU is a sizing problem, not a feature comparison. The question is always: does the model fit in VRAM with enough headroom for the KV cache and intermediate activations?
+
+### 19.1 Available SKUs
+
+| SKU | GPU | VRAM | Approx. Cost | Best For |
+| --- | --- | --- | --- | --- |
+| Standard_NC4as_T4_v3 | T4 | 16 GB | ~$0.53/hr | NER, classifiers, models ≤7B |
+| Standard_NC12s_v3 | V100 | 12 GB | ~$0.90/hr | Mid-size models, fp16 |
+| Standard_NC24ads_A100_v4 | A100 | 80 GB | ~$3.67/hr | 20B+ params, vLLM serving |
+| Standard_NC40ads_H100_v5 | H100 NVL | 94 GB | Higher | Faster A100 alternative |
+| Standard_NV36ads_A10_v5 | A10 | 24 GB | Mid-range | Fallback when A100 is unavailable |
+
+### 19.2 Model Size to GPU Mapping
+
+A model in fp16 needs approximately **2× its parameter count in GB of VRAM**. Each parameter is 2 bytes. For fp32, multiply by 4. For 4-bit quantization (AWQ, GPTQ), divide the fp16 requirement by 4.
+
+| Model Size | FP16 VRAM | 4-bit VRAM | Minimum SKU |
+| --- | --- | --- | --- |
+| 7B parameters | ~14 GB | ~3.5 GB | T4 (tight) or V100 |
+| 14B parameters | ~28 GB | ~7 GB | A10 or A100 |
+| 20B parameters | ~40 GB | ~10 GB | A100 |
+| 70B parameters | ~140 GB | ~35 GB | A100 80GB (quantized only) |
+
+These numbers are for weights alone. The KV cache, intermediate activations, and vLLM's memory management overhead add 10–20% on top. Multiply the weight estimate by 1.15 to get a practical minimum, then check that it sits below 85% of total VRAM to leave room for CUDA memory fragmentation.
+
+> *We spent seven days debugging an endpoint that kept crashing on startup. The container would start, `init()` would begin loading the model, VRAM would fill, CUDA would throw out-of-memory, the container would crash, Azure would restart it, and the cycle would repeat. The deployment never left "Creating" state and logs were inaccessible because the container never lived long enough to produce them. The root cause was a 14.5 GB model (fp16) on a 12 GB GPU. The fix was using a larger SKU. The debugging cost far exceeded the price difference between T4 and A10.*
+
+### 19.3 GPU Fallback Chains
+
+Large GPU SKUs (A100, H100) are frequently out of capacity, especially in popular regions. A production deployment script should try SKUs in preference order and catch capacity errors to fall through:
+
+```yaml
+gpu_sku_fallback:
+  - instance_type: "Standard_NC24ads_A100_v4"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NC40ads_H100_v5"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NV36ads_A10_v5"
+    max_model_len: 4096     # degraded context window
+    gpu_memory_utilization: 0.85
+```
+
+Each tier carries its own vLLM configuration to account for different VRAM budgets. The A10 fallback cuts context length in half — this is acceptable for many workloads and much better than failing to deploy entirely.
+
+GPU quota is regional. Check your quota before deploying: some regions have zero available A100/H100 quota. Requesting an increase through the Azure portal takes 1–3 business days. Discover this during planning, not at deployment time.
+
+---
+
+## 20. Deployment Configuration
+
+### 20.1 The Full Deployment Script
+
+```python
+from azure.ai.ml.entities import (
+    ManagedOnlineEndpoint,
+    ManagedOnlineDeployment,
+    CodeConfiguration,
+    OnlineRequestSettings,
+    ProbeSettings,
+)
+
+# 1. Create endpoint (the stable URL)
+endpoint = ManagedOnlineEndpoint(
+    name="my-llm-endpoint",
+    auth_mode="key",
+)
+endpoint = ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# 2. Create deployment (the running container)
+deployment = ManagedOnlineDeployment(
+    name="blue",
+    endpoint_name="my-llm-endpoint",
+    model="azureml:my-model:1",
+    environment="azureml:vllm-serving-env:2",
+    code_configuration=CodeConfiguration(
+        code="./scoring_scripts",
+        scoring_script="score.py",
+    ),
+    instance_type="Standard_NC24ads_A100_v4",
+    instance_count=1,
+    request_settings=OnlineRequestSettings(
+        request_timeout_ms=300000,       # 5 min per request
+        max_concurrent_requests_per_instance=1,
+        max_queue_wait_ms=300000,
+    ),
+    liveness_probe=ProbeSettings(
+        initial_delay=600,    # 10 min before first health check
+        timeout=30,
+        period=100,
+        failure_threshold=30,
+    ),
+    readiness_probe=ProbeSettings(
+        initial_delay=600,
+        timeout=30,
+        period=30,
+        failure_threshold=30,
+    ),
+)
+deployment = ml_client.online_deployments.begin_create_or_update(deployment).result()
+
+# 3. Route traffic
+endpoint.traffic = {"blue": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+```
+
+### 20.2 Why Probe Settings Matter
+
+Large models take 5–10 minutes to load into GPU memory during `init()`. Azure ML uses liveness and readiness probes to check container health. If a probe fires before `init()` finishes loading the model, Azure concludes the container is unhealthy, kills it, and starts a new one. The new container also takes 5–10 minutes to load, gets killed, and the cycle repeats. The deployment stays in "Creating" state forever with no logs visible.
+
+> *Set `initial_delay` to at least 600 seconds (10 minutes) for any deployment that loads a large model. For 70B+ models, use 900 seconds. This single setting prevents the most common invisible failure mode in GPU deployments. It is not documented prominently and there is no error message that tells you the probe is the problem — the deployment simply never transitions out of "Creating."*
+
+### 20.3 The SDK Object Gotcha
+
+The SDK requires `OnlineRequestSettings` and `ProbeSettings` to be proper SDK objects, not Python dicts. Passing a dict compiles without error and the deployment appears to succeed, but timeout behavior does not work as configured:
+
+```python
+# WRONG — dict compiles but fails silently
+request_settings={"request_timeout_ms": 180000}
+
+# CORRECT — use the SDK class
+request_settings=OnlineRequestSettings(request_timeout_ms=180000)
+```
+
+### 20.4 Model Registration
+
+Before deploying, register your model in the workspace:
+
+```python
+from azure.ai.ml.entities import Model
+from azure.ai.ml.constants import AssetTypes
+
+model = Model(
+    name="my-model",
+    version="1",
+    path="/path/to/model/files",
+    type=AssetTypes.CUSTOM_MODEL,
+    description="Model description",
+)
+registered = ml_client.models.create_or_update(model)
+```
+
+For large models (40GB+), upload to Azure Blob Storage first, then register using the blob path. Direct upload from a compute instance is unreliable for files this size.
+
+---
+
+## 21. Blue-Green Deployments and Traffic Routing
+
+Azure ML supports multiple deployments under a single endpoint. Each deployment runs independently with its own model version, environment, and SKU. Traffic is split by percentage. This enables canary rollouts, A/B testing, and zero-downtime model updates.
+
+```python
+# Deploy green alongside existing blue
+green = ManagedOnlineDeployment(
+    name="green",
+    endpoint_name="my-llm-endpoint",
+    # ... new model version, new environment ...
+)
+ml_client.online_deployments.begin_create_or_update(green).result()
+
+# Canary: 10% to green
+endpoint.traffic = {"blue": 90, "green": 10}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Full cutover after validation
+endpoint.traffic = {"blue": 0, "green": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Remove old deployment to stop billing
+ml_client.online_deployments.begin_delete(
+    name="blue", endpoint_name="my-llm-endpoint"
+).result()
+```
+
+You can bypass the traffic split entirely by adding the header `azureml-model-deployment: green` to a request, routing it to a specific deployment for testing before shifting any production traffic.
+
+> *A newly created deployment receives 0% traffic by default. If you deploy and forget to set traffic, the endpoint returns errors for all requests because no deployment is receiving them. Always explicitly set traffic after creating a deployment.*
+
+---
+
+## 22. Multi-Endpoint Orchestrator Architecture
+
+Complex ML pipelines that chain multiple models — summarization feeding into NER feeding into fact-checking — should not be deployed as a single monolithic endpoint. Deploy each model as its own endpoint and use a lightweight CPU orchestrator as the single client-facing entry point.
+
+```
+Client → Orchestrator (CPU endpoint)
+              ├── LLM Summarizer   (GPU, A100)
+              ├── NER Model A       (GPU, T4)
+              ├── NER Model B       (GPU, T4)
+              └── Entity Linker     (GPU or CPU)
+```
+
+The orchestrator receives the client request, fans out HTTP calls to sub-endpoints in parallel using `ThreadPoolExecutor`, collects and merges results, and returns a unified response. It runs on a CPU SKU (`Standard_F8s_v2`, ~$0.34/hr) because it does no inference — only coordination, lightweight embedding, and result formatting.
+
+**Pass endpoint URLs and API keys in the request payload, not as environment variables.** This makes the system reconfigurable without redeploying the orchestrator. Swap a model endpoint, rotate an API key, or add a new NER model — all without touching the running orchestrator container.
+
+Dictionary-based NER and entity linking can run on CPU if latency tolerance is 2–3 seconds per call instead of sub-second. For single-document inference, CPU is fine. For batch processing hundreds of documents, GPU is worth it.
+
+### 22.1 Cost Example
+
+| Component | SKU | Count | Cost/hr |
+| --- | --- | --- | --- |
+| Orchestrator | F8s_v2 (CPU) | 1 | ~$0.34 |
+| LLM (20B params) | NC24ads A100 | 1 | ~$3.67 |
+| NER Models | NC4as T4 | 3 | ~$1.59 |
+| Entity Linkers | NC4as T4 | 3 | ~$1.59 |
+| **Total** | | | **~$7.19** |
+
+Adding a 70B model (AWQ 4-bit on A100) pushes the total to ~$11/hr. Evaluate whether the quality improvement justifies 3–4× the cost of the next tier down — often a distilled 20B model closes enough of the gap.
+
+---
+
+## 23. Debugging Failed Deployments
+
+### 23.1 The "Creating" State Loop
+
+The most frustrating failure mode: the deployment sits in "Creating" for 30+ minutes with no logs. The container has not started, so there is nothing to log. Diagnosis, in order of likelihood:
+
+**Environment build timeout.** Check the build log in your workspace storage account. If the Docker build failed, no container was ever created.
+
+**Probe restart loop.** If `initial_delay` is too short, the container loads for 5 minutes, gets killed by the liveness probe, restarts, loads again, gets killed again. Increase `initial_delay` to 600+ seconds.
+
+**GPU quota exhausted.** The deployment is waiting for capacity that does not exist. Check quota with:
+
+```python
+from azure.mgmt.compute import ComputeManagementClient
+
+compute_client = ComputeManagementClient(
+    DefaultAzureCredential(), "your-subscription-id"
+)
+for u in compute_client.usage.list("your-region"):
+    if any(k in u.name.localized_value.lower() for k in ["nc24", "a100", "gpu"]):
+        print(f"{u.name.localized_value}: {u.current_value}/{u.limit}")
+```
+
+**`init()` crashing.** Import errors, CUDA OOM, model file not found. You cannot see these until the container runs long enough to produce logs. Once it does:
+
+```python
+logs = ml_client.online_deployments.get_logs(
+    name="blue", endpoint_name="my-endpoint", lines=200
+)
+print(logs)
+```
+
+### 23.2 Common Error Patterns
+
+| Error | Root Cause | Fix |
+| --- | --- | --- |
+| timeout waiting for Environment Image | Conda env too complex for Docker build | Simplify YAML, use pre-built base image |
+| ImportError: cannot import name X | Library version mismatch | Verify import exists in pinned version |
+| Stuck in Creating indefinitely | init() crash or probe restart loop | Increase initial_delay, add logging to init() |
+| run() returns empty response | Returning dict instead of string | Always json.dumps() |
+| pydantic version conflict | azureml-inference-server-http pins pydantic | Match pydantic to server requirements |
+| CUDA out of memory | Model too large for GPU | Larger SKU or quantize the model |
+
+### 23.3 The Runtime Installation Escape Hatch
+
+When environment builds fail repeatedly — usually complex combinations of CUDA, PyTorch, and vLLM — there is a last-resort technique: use a minimal pre-built environment and install packages inside `init()` at runtime:
+
+```python
+import subprocess, sys, os
+
+def init():
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "torch", "transformers", "vllm", "--quiet"
+    ])
+    from vllm import LLM
+    global llm
+    llm = LLM(model=os.environ["AZUREML_MODEL_DIR"])
+```
+
+The first request takes 2–3 minutes while packages install. Subsequent requests use the cached installation. This bypasses the Docker build entirely. It is inelegant and should not be standard practice, but when nothing else works, it ships.
+
+---
+
+## 24. Deployment Lessons
+
+These are patterns that emerged from months of production deployment work. None are in the official documentation.
+
+### 24.1 Delete and Recreate; Never Update Failed Deployments
+
+When a deployment fails, calling `begin_create_or_update` on the same deployment usually fails again with stale state — cached Docker layers, partially downloaded models, corrupted container state. The reliable pattern is `begin_delete()`, wait for completion, create fresh. This adds 5 minutes but prevents hours of chasing phantom errors from stale state. Treat failed deployments as disposable.
+
+### 24.2 Register Environments Before Deploying
+
+Do not combine environment registration and deployment into one step. Register the environment first with `ml_client.environments.create_or_update()`, wait for the Docker image to build, confirm success, then deploy. This separates two independent failure modes — environment build and container startup — so you diagnose each one clearly. Combined, a failure could be either, and the error messages do not distinguish.
+
+### 24.3 The code_path Uploads Everything
+
+When you specify `code="./scoring_scripts"` in CodeConfiguration, Azure uploads **every file** in that directory to the deployment container. If the directory contains model weights, datasets, notebooks, or anything large, the upload will be slow or fail. Keep the code directory to scoring scripts and small config files only. Model weights belong in registered Azure ML models, not in the code path.
+
+### 24.4 Test Scoring Scripts Locally Before Deploying
+
+Your Azure ML compute instance has the same GPU that your endpoint will use. Before deploying, copy the scoring script to the compute, import it, call `init()` to load the model, call `run()` with sample JSON. This catches 90% of issues — import errors, model path problems, VRAM limits, serialization bugs — for free, in seconds, with full stack traces. A failed deployment takes 10–30 minutes to surface the same error, if it surfaces at all.
+
+### 24.5 Use Compute Instance Serving for Development
+
+Managed endpoints are for production — when other systems need a stable URL. During development and benchmarking, run the model directly on your compute instance. A vLLM server on localhost or an Ollama instance gives you the same inference quality with zero deployment overhead, zero extra cost beyond the compute itself, and instant iteration. Deploy as a managed endpoint only when you need a stable URL for integration.
+
+### 24.6 Pre-Deployment Checklist
+
+| Check | Verification | Failure If Skipped |
+| --- | --- | --- |
+| Environment builds | Register separately, wait for Docker build | 30 min in Creating, then failure |
+| Imports are valid | `pip show <pkg>` on compute instance | Container crash, no visible logs |
+| `run()` returns `json.dumps()` | Test locally with sample input | Empty or malformed responses |
+| Model fits GPU | Param count × 2 bytes ≤ VRAM × 0.85 | CUDA OOM, infinite restart loop |
+| Probe initial_delay ≥ 600s | Check deployment config | Container killed before load, stuck in Creating |
+| `azureml-inference-server-http` in env | Check conda YAML | No HTTP server, all requests fail |
+| Traffic set after deployment | Explicitly set `endpoint.traffic` | 0% traffic, endpoint returns errors |
+
+> *The most expensive lesson across all of this: the gap between "model works on a compute instance" and "model works as a managed endpoint" is almost entirely operational, not algorithmic. The model is the same. The math is the same. What changes is the packaging, the probes, the environment builds, the traffic routing, and the debugging visibility. Mastering this operational layer is what separates an ML engineer who builds prototypes from one who runs production systems.*
+
+---
+
+
+## 18. Production GPU Deployment on Azure ML (SDK v2)
+
+Everything up to this point assumes you have a model and want to make it better, faster, or smaller. This section assumes you have a model and need to put it behind a URL that other systems can call reliably. The gap between "it works on my machine" and "it works as a managed endpoint" is where most ML engineering time actually goes.
+
+Azure ML SDK v2 organizes deployment around five objects: **MLClient** (authentication), **Endpoint** (the stable URL), **Deployment** (the running container behind that URL), **Environment** (the Docker image plus packages), and **CodeConfiguration** (the scoring script). Understanding the boundaries between these objects prevents most first-time deployment failures.
+
+```python
+from azure.ai.ml import MLClient
+from azure.identity import DefaultAzureCredential
+
+ml_client = MLClient(
+    DefaultAzureCredential(),
+    subscription_id="your-sub-id",
+    resource_group_name="your-rg",
+    workspace_name="your-workspace",
+)
+```
+
+`DefaultAzureCredential` works automatically from Azure ML compute instances. Use `AzureCliCredential` after `az login` when running from a local machine.
+
+### 18.1 The Environment Build Problem
+
+Azure ML builds a Docker image from your conda YAML plus a base image. Complex environments — anything combining PyTorch, CUDA, transformers, and vLLM — routinely time out during the Docker build step. This is the single biggest source of failed deployments, and it happens before your code even runs.
+
+Three principles that prevent most build failures: keep conda YAMLs minimal with exact version pins and don't mix conda channels with pip for the same library. Use Microsoft's CUDA base images (`mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:latest`) instead of building CUDA from scratch. Register the environment separately before deploying — this isolates the Docker build from the model download and container startup, so you know immediately which step failed.
+
+When a build times out, Azure throws `ResourceOperationFailure` with "timeout while waiting for Environment Image." The actual build log lives in your workspace storage account under `aml-environment-image-build/{env-name}/{version}/`. The error message from Azure itself is never specific enough to diagnose the problem — always check the build log directly.
+
+A working GPU environment YAML for vLLM serving:
+
+```yaml
+name: vllm-serving-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - vllm==0.13.0
+      - torch==2.9.0
+      - transformers==4.57.3
+      - sentencepiece
+      - protobuf
+```
+
+A working CPU environment YAML for an orchestrator that coordinates calls to GPU endpoints:
+
+```yaml
+name: orchestrator-env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - azureml-inference-server-http==1.3.2
+      - sentence-transformers==3.0.1
+      - torch==2.2.2
+      - scikit-learn==1.5.0
+      - numpy==1.26.4
+      - pydantic==2.7.4
+      - pyyaml==6.0.1
+```
+
+> *Environment versions are immutable. Once Azure ML registers an environment at a specific version number, it caches the built Docker image. Changing the conda YAML and re-registering with the same version number silently uses the old cached build. You must bump the version number every time you change the YAML. This is not documented prominently and causes hours of confusion when a "fixed" environment produces the exact same error.*
+
+### 18.2 The azureml-inference-server-http Dependency Trap
+
+The `azureml-inference-server-http` package is required for managed endpoints — it wraps your `init()` and `run()` functions into the HTTP server that Azure calls. But it pins strict sub-dependency versions that silently dictate your entire dependency tree.
+
+Version 1.3.2 requires `pydantic~=2.7.1`. Pinning `pydantic==2.8.0` in the same YAML fails the Docker build with a pip resolver conflict. Version 1.5.0 requires `pydantic~=2.11.0` and specific `opentelemetry` versions. Upgrading the inference server without matching its telemetry pins breaks the build.
+
+> *Before pinning any package version in your environment YAML, run `pip show azureml-inference-server-http` to see what it requires. Match your pins to its constraints, not the other way around. This single package is the most common hidden cause of environment build failures.*
+
+### 18.3 Environment Reference Formats
+
+When referencing an environment in a deployment, format matters. For environments in the same workspace, use `"azureml:my-env:2"` or just `"my-env:2"`. Using the full ARM resource path (`azureml:/subscriptions/.../environments/my-env/versions/2`) for same-workspace environments causes cryptic failures. The full path is only needed for cross-workspace references.
+
+### 18.4 The Scoring Script Contract
+
+Azure ML calls `init()` once when the container starts and `run(raw_data)` for each request. The contract is simple but the failure modes are subtle.
+
+```python
+import os, json, logging
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global model
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    logger.info(f"Model dir contents: {os.listdir(model_dir)}")
+    # Load your model from model_dir
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    # ... inference ...
+    return json.dumps({"result": "..."})
+```
+
+Four rules that each cost days of debugging when broken:
+
+**`run()` must return a string.** Returning a Python dict instead of `json.dumps(result)` causes silent failures — the endpoint appears healthy but returns empty or malformed responses. The Azure inference server expects a serialized string and does not auto-convert.
+
+**`AZUREML_MODEL_DIR` has a subdirectory.** When Azure downloads your registered model, it places the files inside a subdirectory of the model dir. Hardcoding the path without listing the directory first fails. Always discover the actual path at runtime:
+
+```python
+model_root = os.environ.get("AZUREML_MODEL_DIR")
+subdirs = [d for d in os.listdir(model_root)
+           if os.path.isdir(os.path.join(model_root, d))]
+model_path = os.path.join(model_root, subdirs[0])
+```
+
+**Verify every import against your pinned version.** A class that exists in version 0.15 of a library may not exist in 0.13. If your environment pins `vllm==0.13.0` but your scoring script imports a class from 0.15, the container crashes during `init()` with an ImportError you cannot see until the container manages to start. Run `pip show <package>` on your compute instance and verify the actual API surface before writing any imports.
+
+**Log everything in `init()`.** If `init()` fails, the container crashes silently and the deployment stays in "Creating" state indefinitely. Print the model directory listing, library versions, GPU device count, and available VRAM. This diagnostic output is the only thing that tells you what went wrong.
+
+### 18.5 vLLM Scoring Script Pattern
+
+For serving LLMs via vLLM inside Azure ML with an OpenAI-compatible interface:
+
+```python
+import os, json, logging
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
+
+def init():
+    global llm, tokenizer
+    model_dir = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_dir)
+               if os.path.isdir(os.path.join(model_dir, d))]
+    model_path = os.path.join(model_dir, subdirs[0]) if subdirs else model_dir
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    llm = LLM(
+        model=model_path,
+        tokenizer=model_path,
+        dtype="auto",              # bf16 on A100, fp16 on T4
+        max_model_len=8192,
+        gpu_memory_utilization=0.90,
+        trust_remote_code=True,
+    )
+    logger.info("vLLM engine loaded")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    messages = data.get("messages", [])
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    params = SamplingParams(
+        temperature=data.get("temperature", 0.3),
+        max_tokens=data.get("max_tokens", 2048),
+        top_p=data.get("top_p", 0.95),
+    )
+    outputs = llm.generate([prompt], params)
+    text = outputs[0].outputs[0].text
+    return json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "usage": {
+            "prompt_tokens": len(outputs[0].prompt_token_ids),
+            "completion_tokens": len(outputs[0].outputs[0].token_ids),
+        },
+    })
+```
+
+The `dtype="auto"` setting is important — vLLM selects bf16 on A100 (which natively supports it) and fp16 on T4 (which does not). Forcing bf16 on a T4 causes a silent performance collapse because the hardware emulates it in software.
+
+### 18.6 NER / Classification Scoring Script Pattern
+
+For smaller models (token classification, span extraction, entity linking) that fit on a T4:
+
+```python
+import os, json
+
+def init():
+    global model
+    model_root = os.environ.get("AZUREML_MODEL_DIR")
+    subdirs = [d for d in os.listdir(model_root)
+               if os.path.isdir(os.path.join(model_root, d))]
+    model_path = os.path.join(model_root, subdirs[0])
+    # model = YourNERModel.from_pretrained(model_path)
+    # model = model.to("cuda")
+
+def run(raw_data: str) -> str:
+    data = json.loads(raw_data)
+    text = data["text"]
+    labels = data.get("labels", ["PERSON", "ORG", "CONDITION"])
+    threshold = data.get("threshold", 0.5)
+    entities = model.predict_entities(text, labels)
+    filtered = [e for e in entities if e["score"] >= threshold]
+    return json.dumps({"entities": filtered})
+```
+
+---
+
+## 19. GPU SKU Selection and Model Sizing
+
+Choosing the right GPU SKU is a sizing problem, not a feature comparison. The question is always: does the model fit in VRAM with enough headroom for the KV cache and intermediate activations?
+
+### 19.1 Available SKUs
+
+| SKU | GPU | VRAM | Approx. Cost | Best For |
+| --- | --- | --- | --- | --- |
+| Standard_NC4as_T4_v3 | T4 | 16 GB | ~$0.53/hr | NER, classifiers, models ≤7B |
+| Standard_NC12s_v3 | V100 | 12 GB | ~$0.90/hr | Mid-size models, fp16 |
+| Standard_NC24ads_A100_v4 | A100 | 80 GB | ~$3.67/hr | 20B+ params, vLLM serving |
+| Standard_NC40ads_H100_v5 | H100 NVL | 94 GB | Higher | Faster A100 alternative |
+| Standard_NV36ads_A10_v5 | A10 | 24 GB | Mid-range | Fallback when A100 is unavailable |
+
+### 19.2 Model Size to GPU Mapping
+
+A model in fp16 needs approximately **2× its parameter count in GB of VRAM**. Each parameter is 2 bytes. For fp32, multiply by 4. For 4-bit quantization (AWQ, GPTQ), divide the fp16 requirement by 4.
+
+| Model Size | FP16 VRAM | 4-bit VRAM | Minimum SKU |
+| --- | --- | --- | --- |
+| 7B parameters | ~14 GB | ~3.5 GB | T4 (tight) or V100 |
+| 14B parameters | ~28 GB | ~7 GB | A10 or A100 |
+| 20B parameters | ~40 GB | ~10 GB | A100 |
+| 70B parameters | ~140 GB | ~35 GB | A100 80GB (quantized only) |
+
+These numbers are for weights alone. The KV cache, intermediate activations, and vLLM's memory management overhead add 10–20% on top. Multiply the weight estimate by 1.15 to get a practical minimum, then check that it sits below 85% of total VRAM to leave room for CUDA memory fragmentation.
+
+> *We spent seven days debugging an endpoint that kept crashing on startup. The container would start, `init()` would begin loading the model, VRAM would fill, CUDA would throw out-of-memory, the container would crash, Azure would restart it, and the cycle would repeat. The deployment never left "Creating" state and logs were inaccessible because the container never lived long enough to produce them. The root cause was a 14.5 GB model (fp16) on a 12 GB GPU. The fix was using a larger SKU. The debugging cost far exceeded the price difference between T4 and A10.*
+
+### 19.3 GPU Fallback Chains
+
+Large GPU SKUs (A100, H100) are frequently out of capacity, especially in popular regions. A production deployment script should try SKUs in preference order and catch capacity errors to fall through:
+
+```yaml
+gpu_sku_fallback:
+  - instance_type: "Standard_NC24ads_A100_v4"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NC40ads_H100_v5"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+  - instance_type: "Standard_NV36ads_A10_v5"
+    max_model_len: 4096     # degraded context window
+    gpu_memory_utilization: 0.85
+```
+
+Each tier carries its own vLLM configuration to account for different VRAM budgets. The A10 fallback cuts context length in half — this is acceptable for many workloads and much better than failing to deploy entirely.
+
+GPU quota is regional. Check your quota before deploying: some regions have zero available A100/H100 quota. Requesting an increase through the Azure portal takes 1–3 business days. Discover this during planning, not at deployment time.
+
+---
+
+## 20. Deployment Configuration
+
+### 20.1 The Full Deployment Script
+
+```python
+from azure.ai.ml.entities import (
+    ManagedOnlineEndpoint,
+    ManagedOnlineDeployment,
+    CodeConfiguration,
+    OnlineRequestSettings,
+    ProbeSettings,
+)
+
+# 1. Create endpoint (the stable URL)
+endpoint = ManagedOnlineEndpoint(
+    name="my-llm-endpoint",
+    auth_mode="key",
+)
+endpoint = ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# 2. Create deployment (the running container)
+deployment = ManagedOnlineDeployment(
+    name="blue",
+    endpoint_name="my-llm-endpoint",
+    model="azureml:my-model:1",
+    environment="azureml:vllm-serving-env:2",
+    code_configuration=CodeConfiguration(
+        code="./scoring_scripts",
+        scoring_script="score.py",
+    ),
+    instance_type="Standard_NC24ads_A100_v4",
+    instance_count=1,
+    request_settings=OnlineRequestSettings(
+        request_timeout_ms=300000,       # 5 min per request
+        max_concurrent_requests_per_instance=1,
+        max_queue_wait_ms=300000,
+    ),
+    liveness_probe=ProbeSettings(
+        initial_delay=600,    # 10 min before first health check
+        timeout=30,
+        period=100,
+        failure_threshold=30,
+    ),
+    readiness_probe=ProbeSettings(
+        initial_delay=600,
+        timeout=30,
+        period=30,
+        failure_threshold=30,
+    ),
+)
+deployment = ml_client.online_deployments.begin_create_or_update(deployment).result()
+
+# 3. Route traffic
+endpoint.traffic = {"blue": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+```
+
+### 20.2 Why Probe Settings Matter
+
+Large models take 5–10 minutes to load into GPU memory during `init()`. Azure ML uses liveness and readiness probes to check container health. If a probe fires before `init()` finishes loading the model, Azure concludes the container is unhealthy, kills it, and starts a new one. The new container also takes 5–10 minutes to load, gets killed, and the cycle repeats. The deployment stays in "Creating" state forever with no logs visible.
+
+> *Set `initial_delay` to at least 600 seconds (10 minutes) for any deployment that loads a large model. For 70B+ models, use 900 seconds. This single setting prevents the most common invisible failure mode in GPU deployments. It is not documented prominently and there is no error message that tells you the probe is the problem — the deployment simply never transitions out of "Creating."*
+
+### 20.3 The SDK Object Gotcha
+
+The SDK requires `OnlineRequestSettings` and `ProbeSettings` to be proper SDK objects, not Python dicts. Passing a dict compiles without error and the deployment appears to succeed, but timeout behavior does not work as configured:
+
+```python
+# WRONG — dict compiles but fails silently
+request_settings={"request_timeout_ms": 180000}
+
+# CORRECT — use the SDK class
+request_settings=OnlineRequestSettings(request_timeout_ms=180000)
+```
+
+### 20.4 Model Registration
+
+Before deploying, register your model in the workspace:
+
+```python
+from azure.ai.ml.entities import Model
+from azure.ai.ml.constants import AssetTypes
+
+model = Model(
+    name="my-model",
+    version="1",
+    path="/path/to/model/files",
+    type=AssetTypes.CUSTOM_MODEL,
+    description="Model description",
+)
+registered = ml_client.models.create_or_update(model)
+```
+
+For large models (40GB+), upload to Azure Blob Storage first, then register using the blob path. Direct upload from a compute instance is unreliable for files this size.
+
+---
+
+## 21. Blue-Green Deployments and Traffic Routing
+
+Azure ML supports multiple deployments under a single endpoint. Each deployment runs independently with its own model version, environment, and SKU. Traffic is split by percentage. This enables canary rollouts, A/B testing, and zero-downtime model updates.
+
+```python
+# Deploy green alongside existing blue
+green = ManagedOnlineDeployment(
+    name="green",
+    endpoint_name="my-llm-endpoint",
+    # ... new model version, new environment ...
+)
+ml_client.online_deployments.begin_create_or_update(green).result()
+
+# Canary: 10% to green
+endpoint.traffic = {"blue": 90, "green": 10}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Full cutover after validation
+endpoint.traffic = {"blue": 0, "green": 100}
+ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+
+# Remove old deployment to stop billing
+ml_client.online_deployments.begin_delete(
+    name="blue", endpoint_name="my-llm-endpoint"
+).result()
+```
+
+You can bypass the traffic split entirely by adding the header `azureml-model-deployment: green` to a request, routing it to a specific deployment for testing before shifting any production traffic.
+
+> *A newly created deployment receives 0% traffic by default. If you deploy and forget to set traffic, the endpoint returns errors for all requests because no deployment is receiving them. Always explicitly set traffic after creating a deployment.*
+
+---
+
+## 22. Multi-Endpoint Orchestrator Architecture
+
+Complex ML pipelines that chain multiple models — summarization feeding into NER feeding into fact-checking — should not be deployed as a single monolithic endpoint. Deploy each model as its own endpoint and use a lightweight CPU orchestrator as the single client-facing entry point.
+
+```
+Client → Orchestrator (CPU endpoint)
+              ├── LLM Summarizer   (GPU, A100)
+              ├── NER Model A       (GPU, T4)
+              ├── NER Model B       (GPU, T4)
+              └── Entity Linker     (GPU or CPU)
+```
+
+The orchestrator receives the client request, fans out HTTP calls to sub-endpoints in parallel using `ThreadPoolExecutor`, collects and merges results, and returns a unified response. It runs on a CPU SKU (`Standard_F8s_v2`, ~$0.34/hr) because it does no inference — only coordination, lightweight embedding, and result formatting.
+
+**Pass endpoint URLs and API keys in the request payload, not as environment variables.** This makes the system reconfigurable without redeploying the orchestrator. Swap a model endpoint, rotate an API key, or add a new NER model — all without touching the running orchestrator container.
+
+Dictionary-based NER and entity linking can run on CPU if latency tolerance is 2–3 seconds per call instead of sub-second. For single-document inference, CPU is fine. For batch processing hundreds of documents, GPU is worth it.
+
+### 22.1 Cost Example
+
+| Component | SKU | Count | Cost/hr |
+| --- | --- | --- | --- |
+| Orchestrator | F8s_v2 (CPU) | 1 | ~$0.34 |
+| LLM (20B params) | NC24ads A100 | 1 | ~$3.67 |
+| NER Models | NC4as T4 | 3 | ~$1.59 |
+| Entity Linkers | NC4as T4 | 3 | ~$1.59 |
+| **Total** | | | **~$7.19** |
+
+Adding a 70B model (AWQ 4-bit on A100) pushes the total to ~$11/hr. Evaluate whether the quality improvement justifies 3–4× the cost of the next tier down — often a distilled 20B model closes enough of the gap.
+
+---
+
+## 23. Debugging Failed Deployments
+
+### 23.1 The "Creating" State Loop
+
+The most frustrating failure mode: the deployment sits in "Creating" for 30+ minutes with no logs. The container has not started, so there is nothing to log. Diagnosis, in order of likelihood:
+
+**Environment build timeout.** Check the build log in your workspace storage account. If the Docker build failed, no container was ever created.
+
+**Probe restart loop.** If `initial_delay` is too short, the container loads for 5 minutes, gets killed by the liveness probe, restarts, loads again, gets killed again. Increase `initial_delay` to 600+ seconds.
+
+**GPU quota exhausted.** The deployment is waiting for capacity that does not exist. Check quota with:
+
+```python
+from azure.mgmt.compute import ComputeManagementClient
+
+compute_client = ComputeManagementClient(
+    DefaultAzureCredential(), "your-subscription-id"
+)
+for u in compute_client.usage.list("your-region"):
+    if any(k in u.name.localized_value.lower() for k in ["nc24", "a100", "gpu"]):
+        print(f"{u.name.localized_value}: {u.current_value}/{u.limit}")
+```
+
+**`init()` crashing.** Import errors, CUDA OOM, model file not found. You cannot see these until the container runs long enough to produce logs. Once it does:
+
+```python
+logs = ml_client.online_deployments.get_logs(
+    name="blue", endpoint_name="my-endpoint", lines=200
+)
+print(logs)
+```
+
+### 23.2 Common Error Patterns
+
+| Error | Root Cause | Fix |
+| --- | --- | --- |
+| timeout waiting for Environment Image | Conda env too complex for Docker build | Simplify YAML, use pre-built base image |
+| ImportError: cannot import name X | Library version mismatch | Verify import exists in pinned version |
+| Stuck in Creating indefinitely | init() crash or probe restart loop | Increase initial_delay, add logging to init() |
+| run() returns empty response | Returning dict instead of string | Always json.dumps() |
+| pydantic version conflict | azureml-inference-server-http pins pydantic | Match pydantic to server requirements |
+| CUDA out of memory | Model too large for GPU | Larger SKU or quantize the model |
+
+### 23.3 The Runtime Installation Escape Hatch
+
+When environment builds fail repeatedly — usually complex combinations of CUDA, PyTorch, and vLLM — there is a last-resort technique: use a minimal pre-built environment and install packages inside `init()` at runtime:
+
+```python
+import subprocess, sys, os
+
+def init():
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "torch", "transformers", "vllm", "--quiet"
+    ])
+    from vllm import LLM
+    global llm
+    llm = LLM(model=os.environ["AZUREML_MODEL_DIR"])
+```
+
+The first request takes 2–3 minutes while packages install. Subsequent requests use the cached installation. This bypasses the Docker build entirely. It is inelegant and should not be standard practice, but when nothing else works, it ships.
+
+---
+
+## 24. Deployment Lessons
+
+These are patterns that emerged from months of production deployment work. None are in the official documentation.
+
+### 24.1 Delete and Recreate; Never Update Failed Deployments
+
+When a deployment fails, calling `begin_create_or_update` on the same deployment usually fails again with stale state — cached Docker layers, partially downloaded models, corrupted container state. The reliable pattern is `begin_delete()`, wait for completion, create fresh. This adds 5 minutes but prevents hours of chasing phantom errors from stale state. Treat failed deployments as disposable.
+
+### 24.2 Register Environments Before Deploying
+
+Do not combine environment registration and deployment into one step. Register the environment first with `ml_client.environments.create_or_update()`, wait for the Docker image to build, confirm success, then deploy. This separates two independent failure modes — environment build and container startup — so you diagnose each one clearly. Combined, a failure could be either, and the error messages do not distinguish.
+
+### 24.3 The code_path Uploads Everything
+
+When you specify `code="./scoring_scripts"` in CodeConfiguration, Azure uploads **every file** in that directory to the deployment container. If the directory contains model weights, datasets, notebooks, or anything large, the upload will be slow or fail. Keep the code directory to scoring scripts and small config files only. Model weights belong in registered Azure ML models, not in the code path.
+
+### 24.4 Test Scoring Scripts Locally Before Deploying
+
+Your Azure ML compute instance has the same GPU that your endpoint will use. Before deploying, copy the scoring script to the compute, import it, call `init()` to load the model, call `run()` with sample JSON. This catches 90% of issues — import errors, model path problems, VRAM limits, serialization bugs — for free, in seconds, with full stack traces. A failed deployment takes 10–30 minutes to surface the same error, if it surfaces at all.
+
+### 24.5 Use Compute Instance Serving for Development
+
+Managed endpoints are for production — when other systems need a stable URL. During development and benchmarking, run the model directly on your compute instance. A vLLM server on localhost or an Ollama instance gives you the same inference quality with zero deployment overhead, zero extra cost beyond the compute itself, and instant iteration. Deploy as a managed endpoint only when you need a stable URL for integration.
+
+### 24.6 Pre-Deployment Checklist
+
+| Check | Verification | Failure If Skipped |
+| --- | --- | --- |
+| Environment builds | Register separately, wait for Docker build | 30 min in Creating, then failure |
+| Imports are valid | `pip show <pkg>` on compute instance | Container crash, no visible logs |
+| `run()` returns `json.dumps()` | Test locally with sample input | Empty or malformed responses |
+| Model fits GPU | Param count × 2 bytes ≤ VRAM × 0.85 | CUDA OOM, infinite restart loop |
+| Probe initial_delay ≥ 600s | Check deployment config | Container killed before load, stuck in Creating |
+| `azureml-inference-server-http` in env | Check conda YAML | No HTTP server, all requests fail |
+| Traffic set after deployment | Explicitly set `endpoint.traffic` | 0% traffic, endpoint returns errors |
+
+> *The most expensive lesson across all of this: the gap between "model works on a compute instance" and "model works as a managed endpoint" is almost entirely operational, not algorithmic. The model is the same. The math is the same. What changes is the packaging, the probes, the environment builds, the traffic routing, and the debugging visibility. Mastering this operational layer is what separates an ML engineer who builds prototypes from one who runs production systems.*
